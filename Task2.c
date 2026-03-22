@@ -1,162 +1,144 @@
 #include <stdio.h>
 #include <stdlib.h>
+#include <string.h>
 #include <time.h>
 #include <pthread.h>
 #include <immintrin.h>
-#include <string.h>
 
-#define BUF_SIZE (256 * 1024 * 1024)
+#define BUFFER_SIZE_MB 256
+#define BUFFER_SIZE ((size_t)BUFFER_SIZE_MB * 1024 * 1024)
 #define NUM_THREADS 4
 
-char *buf1;
-char *buf2;
-char *buf3;
+typedef struct {
+    char *buf;
+    size_t start;
+    size_t end;
+} thread_arg;
 
-void generate_buffer(char *buf) 
+static double now_sec(void)
 {
-    for (int i = 0; i < BUF_SIZE; i++) {
-        int r = rand() % 4;
-        if (r == 0)      
-		buf[i] = 'a' + rand() % 26;
-        else if (r == 1) 
-		buf[i] = 'A' + rand() % 26;
-        else if (r == 2) 
-		buf[i] = '0' + rand() % 10;
-        else             
-		buf[i] = "!@#$%^&*() "[rand() % 11];
-    }
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return ts.tv_sec + ts.tv_nsec * 1e-9;
 }
 
-void *thread_worker(void *arg) 
+static void generate_buffer(char *buf, size_t size)
 {
-    int id = *((int *)arg);
-    int start = id * (BUF_SIZE / NUM_THREADS);
-    int end = (id == NUM_THREADS - 1) ? BUF_SIZE : (id + 1) * (BUF_SIZE / NUM_THREADS);
+    static const char charset[] = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789!@#$%^&*()_+-=[]{}|;:,.<>? ";
+    int len = sizeof(charset) - 1;
+    srand(42);
+    for (size_t i = 0; i < size; i++)
+        buf[i] = charset[rand() % len];
+}
 
-    for (int i = start; i < end; i++){
-        if (buf1[i] >= 'a' && buf1[i] <= 'z')
-            buf1[i] -= 32;
+static void *thread_func(void *arg)
+{
+    thread_arg *th = (thread_arg *)arg;
+    for (size_t i = th->start; i < th->end; i++) {
+        if (th->buf[i] >= 'a' && th->buf[i] <= 'z')
+            th->buf[i] -= 32;
     }
     return NULL;
 }
 
-void to_upper_simd(char *buf) 
+static void convert_simd(char *buf, size_t size)
 {
-    __m256i va  = _mm256_set1_epi8('a');
-    __m256i vz  = _mm256_set1_epi8('z');
-    __m256i v32 = _mm256_set1_epi8(32);
+    __m256i vec_a    = _mm256_set1_epi8('a');
+    __m256i vec_z    = _mm256_set1_epi8('z');
+    __m256i vec_diff = _mm256_set1_epi8(32);
 
-    for (int i = 0; i + 32 <= BUF_SIZE; i += 32){
+    size_t i = 0;
+    for (; i + 32 <= size; i += 32) {
         __m256i chunk = _mm256_loadu_si256((__m256i *)(buf + i));
-        __m256i ge_a = _mm256_cmpgt_epi8(chunk, _mm256_sub_epi8(va, _mm256_set1_epi8(1)));
-        __m256i le_z = _mm256_cmpgt_epi8(_mm256_add_epi8(vz, _mm256_set1_epi8(1)), chunk);
+
+        __m256i ge_a = _mm256_cmpgt_epi8(chunk, _mm256_sub_epi8(vec_a, _mm256_set1_epi8(1)));
+        __m256i le_z = _mm256_cmpgt_epi8(_mm256_add_epi8(vec_z, _mm256_set1_epi8(1)), chunk);
         __m256i mask = _mm256_and_si256(ge_a, le_z);
-        __m256i result = _mm256_sub_epi8(chunk, _mm256_and_si256(mask, v32));
-        _mm256_storeu_si256((__m256i *)(buf + i), result);
+
+        __m256i converted = _mm256_sub_epi8(chunk, _mm256_and_si256(mask, vec_diff));
+        _mm256_storeu_si256((__m256i *)(buf + i), converted);
     }
 
-    for (int i = 0; i < BUF_SIZE; i++){
+    for (; i < size; i++) {
         if (buf[i] >= 'a' && buf[i] <= 'z')
             buf[i] -= 32;
     }
 }
 
-void *thread_simd_worker(void *arg) 
+static void *thread_func_simd(void *arg)
 {
-    int id = *((int *)arg);
-    int start = id * (BUF_SIZE / NUM_THREADS);
-    int end = (id == NUM_THREADS - 1) ? BUF_SIZE : (id + 1) * (BUF_SIZE / NUM_THREADS);
-
-    __m256i va = _mm256_set1_epi8('a');
-    __m256i vz = _mm256_set1_epi8('z');
-    __m256i v32 = _mm256_set1_epi8(32);
-
-    for (int i = start; i + 32 <= end; i += 32) {
-        __m256i chunk = _mm256_loadu_si256((__m256i *)(buf3 + i));
-        __m256i ge_a = _mm256_cmpgt_epi8(chunk, _mm256_sub_epi8(va, _mm256_set1_epi8(1)));
-        __m256i le_z = _mm256_cmpgt_epi8(_mm256_add_epi8(vz, _mm256_set1_epi8(1)), chunk);
-        __m256i mask = _mm256_and_si256(ge_a, le_z);
-        __m256i result = _mm256_sub_epi8(chunk, _mm256_and_si256(mask, v32));
-        _mm256_storeu_si256((__m256i *)(buf3 + i), result);
-    }
-
-    for (int i = start; i < end; i++){
-        if (buf3[i] >= 'a' && buf3[i] <= 'z')
-            buf3[i] -= 32;
-    }
-
+    thread_arg *th = (thread_arg *)arg;
+    convert_simd(th->buf + th->start, th->end - th->start);
     return NULL;
 }
 
-int main() 
+int main()
 {
-    srand(42);
-
-    buf1 = (char *)malloc(BUF_SIZE);
-    buf2 = (char *)malloc(BUF_SIZE);
-    buf3 = (char *)malloc(BUF_SIZE);
-
-    if (!buf1 || !buf2 || !buf3) {
+    char *buf_mt   = malloc(BUFFER_SIZE);
+    char *buf_simd = malloc(BUFFER_SIZE);
+    char *buf_simd_mt = malloc(BUFFER_SIZE);
+    if(!buf_mt || !buf_simd || !buf_simd_mt){
         printf("malloc failed");
         return 1;
     }
-
-    generate_buffer(buf1);
-    memcpy(buf2, buf1, BUF_SIZE);
-    memcpy(buf3, buf1, BUF_SIZE);
-
-    printf("Buffer size: %d MB\n", BUF_SIZE / 1024 / 1024);
+    
+    printf("Generating random buffer.\n");
+    generate_buffer(buf_mt, BUFFER_SIZE);
+    memcpy(buf_simd,    buf_mt, BUFFER_SIZE);
+    memcpy(buf_simd_mt, buf_mt, BUFFER_SIZE);
+    printf("Finished.\n");
+    printf("Buffer size: %d MB\n", BUFFER_SIZE_MB);
     printf("Threads used: %d\n", NUM_THREADS);
 
-    struct timespec start, end;
     pthread_t threads[NUM_THREADS];
-    int thread_ids[NUM_THREADS];
+    thread_arg args[NUM_THREADS];
+    size_t chunk = BUFFER_SIZE / NUM_THREADS;
 
-    clock_gettime(CLOCK_MONOTONIC, &start);
-    for (int i = 0; i < NUM_THREADS; i++){
-        thread_ids[i] = i;
-        if (pthread_create(&threads[i], NULL, thread_worker, &thread_ids[i]) != 0){
+    double start_sec = now_sec();
+    for(int i = 0; i < NUM_THREADS; i++){
+        args[i].buf   = buf_mt;
+        args[i].start = i * chunk;
+        args[i].end   = (i == NUM_THREADS - 1) ? BUFFER_SIZE : (i + 1) * chunk;
+        if(pthread_create(&threads[i], NULL, thread_func, &args[i]) != 0){
             printf("thread create failed\n");
-            return 1;
+            exit(1);
         }
     }
-    for (int i = 0; i < NUM_THREADS; i++){
-        if (pthread_join(threads[i], NULL) != 0){
+    for(int i = 0; i < NUM_THREADS; i++){
+        if(pthread_join(threads[i], NULL) != 0){
             printf("thread join failed\n");
-            return 1;
+            exit(1);
         }
     }
-    clock_gettime(CLOCK_MONOTONIC, &end);
-    printf("Multithreading time: %.3f sec\n",
-           (end.tv_sec - start.tv_sec) + (end.tv_nsec - start.tv_nsec) * 1e-9);
+    double time_diff = now_sec() - start_sec;
+    printf("Multithreading time: %.3f sec\n", time_diff);
 
-    clock_gettime(CLOCK_MONOTONIC, &start);
-    to_upper_simd(buf2);
-    clock_gettime(CLOCK_MONOTONIC, &end);
-    printf("SIMD time: %.3f sec\n",
-           (end.tv_sec - start.tv_sec) + (end.tv_nsec - start.tv_nsec) * 1e-9);
+    start_sec = now_sec();
+    convert_simd(buf_simd, BUFFER_SIZE);
+    time_diff = now_sec() - start_sec;
+    printf("SIMD time: %.3f sec\n", time_diff);
 
-    clock_gettime(CLOCK_MONOTONIC, &start);
-    for (int i = 0; i < NUM_THREADS; i++){
-        thread_ids[i] = i;
-        if (pthread_create(&threads[i], NULL, thread_simd_worker, &thread_ids[i]) != 0){
+    start_sec = now_sec();
+    for (int i = 0; i < NUM_THREADS; i++) {
+        args[i].buf   = buf_simd_mt;
+        args[i].start = i * chunk;
+        args[i].end   = (i == NUM_THREADS - 1) ? BUFFER_SIZE : (i + 1) * chunk;
+        if (pthread_create(&threads[i], NULL, thread_func_simd, &args[i]) != 0) {
             printf("thread create failed\n");
-            return 1;
+            exit(1);
         }
     }
-    for (int i = 0; i < NUM_THREADS; i++){
-        if (pthread_join(threads[i], NULL) != 0){
+    for (int i = 0; i < NUM_THREADS; i++) {
+        if (pthread_join(threads[i], NULL) != 0) {
             printf("thread join failed\n");
-            return 1;
+            exit(1);
         }
     }
-    clock_gettime(CLOCK_MONOTONIC, &end);
-    printf("SIMD + Multithreading: %.3f sec\n",
-           (end.tv_sec - start.tv_sec) + (end.tv_nsec - start.tv_nsec) * 1e-9);
+    double simd_mt_time = now_sec() - start_sec;
+    printf("SIMD + Multithreading: %.3f sec\n", simd_mt_time);
 
-    free(buf1); 
-    free(buf2); 
-    free(buf3);
-
+    free(buf_mt);
+    free(buf_simd);
+    free(buf_simd_mt);
     return 0;
 }
